@@ -482,6 +482,24 @@ class Attraction:
     def __str__(self) -> str:
         return f"{self.name} ({self.category}, {self.setting})"
 
+@dataclass(frozen=True)
+class RadarFrame:
+    """One rain-radar picture of the whole world at one moment (RainViewer, every 10 minutes).
+
+    The picture is cut into map tiles; ``tile_url`` gives the address of one of them.
+    """
+
+    time: datetime  # timezone-aware, UTC
+    url_template: str  # contains {z}, {x} and {y} placeholders for the tile coordinates
+
+    def tile_url(self, z: int, x: int, y: int) -> str:
+        return self.url_template.format(z=z, x=x, y=y)
+
+    def minutes_ago(self, now: datetime | None = None) -> int:
+        now = now or datetime.now(timezone.utc)
+        return max(0, round((now - self.time).total_seconds() / 60))
+
+
 # a clone of the Attraction class, but with a few extra fields for the user-added attractions
 @dataclass(frozen=True)
 class POICandidate:

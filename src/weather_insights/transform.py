@@ -12,6 +12,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .config import RADAR_MAX_TILES, RADAR_MAX_ZOOM
 from .models import (
     LOG_COLUMNS, Assessment, Assumptions, Attraction, Location, Verdict, WeatherSnapshot, comfort_score,
 )
@@ -157,6 +158,60 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dphi, dlmb = p2 - p1, math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+# ---- map tiles (the Web Mercator grid every web map uses) ----------------------------------------
+# At zoom z the world is cut into 2^z x 2^z square tiles, numbered x from the west and y from the north.
+MERCATOR_MAX_LAT = 85.05112878  # web maps stop here (beyond it the square world map would be infinitely tall)
+
+
+def lonlat_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
+    """(x, y) of the tile that contains a point at ``zoom``."""
+    n = 2 ** zoom
+    lat = max(-MERCATOR_MAX_LAT, min(MERCATOR_MAX_LAT, lat))
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
+
+
+def tile_bounds(x: int, y: int, zoom: int) -> tuple[float, float, float, float]:
+    """(west, south, east, north) edges of a tile, in degrees."""
+    n = 2 ** zoom
+
+    def lat_at(row: int) -> float:
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * row / n))))
+
+    return x / n * 360.0 - 180.0, lat_at(y + 1), (x + 1) / n * 360.0 - 180.0, lat_at(y)
+
+
+def radar_zoom(map_zoom: float) -> int:
+    """Tile zoom to request: the map's zoom, but never deeper than the radar service provides."""
+    return int(min(RADAR_MAX_ZOOM, max(0, math.floor(map_zoom))))
+
+
+def radar_tiles(lat: float, lon: float, pad_km: float, map_zoom: float) -> list[tuple[int, int, int]]:
+    """(z, x, y) of every radar tile needed to cover ``pad_km`` around a point on a map at ``map_zoom``.
+
+    ``x`` is *not* wrapped: next to the 180° meridian it can be -1 or 2^z, so the tile sits on the
+    correct side of the city (``charts.radar_layers`` wraps it back for the picture's address). If
+    the area would need more than RADAR_MAX_TILES pictures (far north or south, where degrees of
+    longitude get short), a coarser zoom is used instead.
+    """
+    dlat = pad_km / 111.32
+    dlon = pad_km / (111.32 * max(math.cos(math.radians(lat)), 0.01))
+    z = radar_zoom(map_zoom)
+    while True:
+        n = 2 ** z
+        x_west = math.floor((lon - dlon + 180.0) / 360.0 * n)
+        x_east = math.floor((lon + dlon + 180.0) / 360.0 * n)
+        if x_east - x_west + 1 > n:  # wider than the whole world: one copy of every column is enough
+            x_west, x_east = 0, n - 1
+        _, y_north = lonlat_to_tile(lat + dlat, lon, z)
+        _, y_south = lonlat_to_tile(lat - dlat, lon, z)
+        tiles = [(z, x, y) for y in range(y_north, y_south + 1) for x in range(x_west, x_east + 1)]
+        if len(tiles) <= RADAR_MAX_TILES or z == 0:
+            return tiles
+        z -= 1
 
 
 def build_grid(center: Location, n: int, radius_km: float) -> list[Location]:

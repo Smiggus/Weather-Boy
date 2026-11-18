@@ -12,7 +12,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from .transform import METRICS, value_range
+from .config import RADAR_OPACITY
+from .models import RadarFrame
+from .transform import METRICS, tile_bounds, value_range
 
 MAP_STYLE = "open-street-map"  # free tiles, no map token needed
 VERDICT_COLORS = {"good": "#2e9e5b", "caution": "#e0a100", "avoid": "#d64545"}
@@ -57,6 +59,46 @@ def field_to_rgba(values: np.ndarray, alpha: np.ndarray, vmin: float, vmax: floa
         rgba[..., channel] = np.interp(t, stops, ramp[:, channel]).round().astype(np.uint8)
     rgba[..., 3] = (alpha * max_opacity * 255).round().astype(np.uint8)
     return rgba
+
+
+def edge_fade(rows: int, cols: int, margin: int) -> np.ndarray:
+    """Alpha mask: 1 inside, easing to 0 over the outer ``margin`` pixels on every side.
+
+    Multiplying the two directions also rounds the corners, so a weather surface blends into the
+    map instead of ending in a hard square. ``margin`` 0 gives a solid mask.
+    """
+    def ramp(n: int) -> np.ndarray:
+        if margin <= 0:
+            return np.ones(n)
+        pixels = np.arange(n)
+        t = np.clip(np.minimum(pixels, n - 1 - pixels) / margin, 0, 1)  # 0 at the edge, 1 from `margin` in
+        return t * t * (3 - 2 * t)  # smoothstep: no visible line where the fade starts
+
+    return np.outer(ramp(rows), ramp(cols))
+
+
+def pad_field(field: dict, share: float) -> tuple[dict, int]:
+    """Extend a close-up surface by ``share`` of its size on every side, repeating the edge values.
+
+    The surface from ``transform.smooth_closeup_field`` ends exactly at the outermost readings, so
+    fading it would hide them. Padding first lets the fade happen outside the readings. Rows are
+    evenly spaced in Web-Mercator y, so the north/south edges are extended in that space too.
+    Returns the padded field and the number of padded pixels per side.
+    """
+    values = field["values"]
+    pad = max(1, round(share * max(values.shape)))
+    rows, cols = values.shape
+    y_north, y_south = (math.log(math.tan(math.pi / 4 + math.radians(field[k]) / 2)) for k in ("north", "south"))
+    dy = (y_north - y_south) * pad / max(rows - 1, 1)
+    dlon = (field["east"] - field["west"]) * pad / max(cols - 1, 1)
+
+    def lat(y: float) -> float:
+        return math.degrees(2 * math.atan(math.exp(y)) - math.pi / 2)
+
+    padded = {"values": np.pad(values, pad, mode="edge"),
+              "north": lat(y_north + dy), "south": lat(y_south - dy),
+              "west": field["west"] - dlon, "east": field["east"] + dlon}
+    return padded, pad
 
 
 def rgba_to_png_data_uri(rgba: np.ndarray) -> str:
@@ -148,15 +190,40 @@ def _attraction_traces(fig: go.Figure, attractions: pd.DataFrame) -> None:
         ))
 
 
+def radar_layers(frame: RadarFrame, tiles: list[tuple[int, int, int]], opacity: float = RADAR_OPACITY) -> list[dict]:
+    """One map image layer per radar tile, each stretched over that tile's exact edges.
+
+    The browser loads the tile pictures straight from RainViewer (no key involved). Using image
+    layers instead of a normal tile layer lets a zoom-7 tile stay visible on a map zoomed in further,
+    where the free service would only send a "zoom level not supported" picture. Plotly does not show
+    credits for image layers, so the UI caption carries RainViewer's required attribution.
+    """
+    layers = []
+    for z, x, y in tiles:
+        west, south, east, north = tile_bounds(x, y, z)  # x may be just past the 180° meridian (see radar_tiles)
+        layers.append({
+            "sourcetype": "image", "source": frame.tile_url(z, x % 2 ** z, y), "opacity": opacity, "below": "traces",
+            "coordinates": [[west, north], [east, north], [east, south], [west, south]],
+        })
+    return layers
+
+
+CELLS_UNDER_RADAR_OPACITY = 0.15  # weather cells stay hoverable but barely tinted while the radar is shown
+CLOSEUP_FADE_SHARE = 0.5  # the smooth surface fades out over this many reading spacings past the outer readings
+
+
 def closeup_map(grid: pd.DataFrame, attractions: pd.DataFrame, centre: tuple[float, float],
                 layer: str, radius_km: float, grid_size: int, field: dict | None = None,
-                fit_colours: bool = False) -> go.Figure:
+                fit_colours: bool = False, radar: list[dict] | None = None) -> go.Figure:
     """Weather around the city + attraction pins.
 
     With ``field`` (from ``transform.smooth_closeup_field``) the weather is a continuous colour
     surface interpolated between the real readings, which are drawn as small dots you can hover.
-    Without it, each reading is shown as a flat square cell. Colours use the fixed scale of the
-    metric unless ``fit_colours`` stretches them to this city's own range.
+    The smooth surface fades out just beyond the outermost readings. Without it, each reading is shown as a flat
+    square cell. Colours use the fixed scale of the metric unless ``fit_colours`` stretches them to
+    this city's own range. With ``radar`` (from ``radar_layers``) the weather colour steps back so
+    the rain is easy to read: the smooth surface is left out (its hoverable dots stay) and cells
+    turn faint. The radar sits below the pins. An empty ``radar`` list counts as no radar.
     """
     lo, hi = value_range(layer, grid[layer], fit=fit_colours)
     label = METRICS[layer]
@@ -172,13 +239,17 @@ def closeup_map(grid: pd.DataFrame, attractions: pd.DataFrame, centre: tuple[flo
                          "colorbar": {"title": label}}),
                 **({"hoverinfo": "skip"} if colour else {"text": _sample_hover(grid, layer), "hoverinfo": "text"}),
             ))
-        rgba = field_to_rgba(field["values"], np.ones_like(field["values"]), lo, hi, layer,
-                              max_opacity=0.55 if layer == "precip_mm" else 0.68)
-        layers = [{
-            "sourcetype": "image", "source": rgba_to_png_data_uri(rgba), "opacity": 1.0, "below": "traces",
-            "coordinates": [[field["west"], field["north"]], [field["east"], field["north"]],
-                            [field["east"], field["south"]], [field["west"], field["south"]]],
-        }]
+        layers = []
+        if not radar:
+            # fade over half a reading spacing beyond the outer readings, so they keep their colour
+            padded, pad = pad_field(field, CLOSEUP_FADE_SHARE / max(grid_size - 1, 1))
+            rgba = field_to_rgba(padded["values"], edge_fade(*padded["values"].shape, margin=pad), lo, hi, layer,
+                                  max_opacity=0.55 if layer == "precip_mm" else 0.68)
+            layers.append({
+                "sourcetype": "image", "source": rgba_to_png_data_uri(rgba), "opacity": 1.0, "below": "traces",
+                "coordinates": [[padded["west"], padded["north"]], [padded["east"], padded["north"]],
+                                [padded["east"], padded["south"]], [padded["west"], padded["south"]]],
+            })
         _attraction_traces(fig, attractions)
         fig.update_layout(map={"style": MAP_STYLE, "center": {"lat": centre[0], "lon": centre[1]},
                                "zoom": zoom, "layers": layers}, height=640)
@@ -186,7 +257,7 @@ def closeup_map(grid: pd.DataFrame, attractions: pd.DataFrame, centre: tuple[flo
         cells = grid.reset_index(drop=True).assign(cell=lambda d: d.index.astype(str))
         fig = px.choropleth_map(
             cells, geojson=grid_cells_geojson(cells, radius_km, grid_size), locations="cell",
-            color=layer, color_continuous_scale=_ramp(layer), opacity=0.6,
+            color=layer, color_continuous_scale=_ramp(layer), opacity=CELLS_UNDER_RADAR_OPACITY if radar else 0.6,
             range_color=(lo, hi) if hi > lo else None, hover_name="description",
             hover_data={"cell": False, "temp": ":.1f", "feels_like": ":.1f", "humidity": ":.0f",
                         "wind_speed": ":.1f", layer: ":.1f"},
@@ -196,6 +267,8 @@ def closeup_map(grid: pd.DataFrame, attractions: pd.DataFrame, centre: tuple[flo
         )
         _attraction_traces(fig, attractions)
 
+    if radar:
+        fig.update_layout(map_layers=[*fig.layout.map.layers, *radar])
     fig.update_layout(margin={"l": 0, "r": 0, "t": 0, "b": 0},
                       legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "x": 0})
     return fig

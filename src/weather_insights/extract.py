@@ -14,15 +14,18 @@ import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Iterable
+from urllib.parse import urlparse
 
 import requests
 
 from .config import (
     API_BASE_URL, MAX_CALLS_PER_MINUTE, NOMINATIM_BASE_URL, NOMINATIM_PERIOD_S, NOMINATIM_USER_AGENT,
-    POI_MAX_KM_FROM_CITY, POI_MAX_RESULTS, POI_SEARCH_BOX_DEG, REQUEST_TIMEOUT_S,
+    POI_MAX_KM_FROM_CITY, POI_MAX_RESULTS, POI_SEARCH_BOX_DEG, RADAR_COLOR_SCHEME, RADAR_OPTIONS,
+    RADAR_TILE_SIZE, RAINVIEWER_BASE_URL, RAINVIEWER_MAX_CALLS_PER_MINUTE, REQUEST_TIMEOUT_S,
 )
-from .models import Location, POICandidate, WeatherSnapshot
+from .models import Location, POICandidate, RadarFrame, WeatherSnapshot
 from .transform import haversine_km
 
 
@@ -368,6 +371,50 @@ class NominatimClient(JSONAPIClient):
             return _to_candidates(hits, city)
         except (AttributeError, KeyError, TypeError, ValueError):
             raise unexpected from None
+
+
+# ---- RainViewer (rain radar) ----------------------------------------------------------------------
+_RADAR_PATH = re.compile(r"/[A-Za-z0-9_/-]+")  # e.g. /v2/radar/02e828aaa1d6
+
+
+class RainViewerClient(JSONAPIClient):
+    """Lists the latest rain-radar frames (past ~2 hours, every 10 minutes). No API key needed.
+
+    The JSON only says *where* the pictures are; the map loads the tile images itself, so this
+    client never downloads images.
+    """
+
+    service_name = "radar service"
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("limiter", RateLimiter(RAINVIEWER_MAX_CALLS_PER_MINUTE))
+        super().__init__(RAINVIEWER_BASE_URL, **kwargs)
+
+    def radar_frames(self) -> list[RadarFrame]:
+        """Past radar frames, oldest first. An empty list if the service has none right now."""
+        payload = self._get("public/weather-maps.json", what="radar data")
+        unexpected = ServerError("The radar service sent an unexpected answer.")
+        try:
+            host = str(payload["host"]).rstrip("/")
+            past = payload.get("radar", {}).get("past") or []
+            items = [(int(item["time"]), str(item["path"])) for item in past]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise unexpected from None
+        # The browser loads these addresses straight onto the map, so the answer may only point at
+        # RainViewer itself, over https, with a plain path (no '@', '?', braces or other tricks).
+        hostname = urlparse(host).hostname or ""
+        if not (host.startswith("https://") and (hostname == "rainviewer.com" or hostname.endswith(".rainviewer.com"))):
+            raise unexpected
+        if not all(_RADAR_PATH.fullmatch(path) for _, path in items):
+            raise unexpected
+        frames = [
+            RadarFrame(
+                datetime.fromtimestamp(t, tz=timezone.utc),
+                f"{host}{path}/{RADAR_TILE_SIZE}/{{z}}/{{x}}/{{y}}/{RADAR_COLOR_SCHEME}/{RADAR_OPTIONS}.png",
+            )
+            for t, path in items
+        ]
+        return sorted(frames, key=lambda f: f.time)
 
 
 # ---- batch fetching --------------------------------------------------------------------------

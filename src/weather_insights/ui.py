@@ -8,12 +8,13 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 
 import pandas as pd
 import streamlit as st
 
 from . import charts, load, pipeline, transform
-from .config import CACHE_TTL_S, LOG_CSV, MissingAPIKeyError
+from .config import CACHE_TTL_S, LOG_CSV, RADAR_CACHE_TTL_S, RADAR_PAD_KM, MissingAPIKeyError
 from .extract import (
     APIError, InvalidAPIKeyError, InvalidInputError, LocationNotFoundError, NetworkError, RateLimitError,
     parse_coordinates,
@@ -54,6 +55,19 @@ def _world_data(keys: tuple):
 @st.cache_data(ttl=CACHE_TTL_S, show_spinner="Sampling weather across the city…")
 def _closeup_data(centre: tuple, grid_size: int, radius_km: float):
     return pipeline.fetch_closeup(_client(), Location(*centre), grid_size, radius_km)
+
+
+@st.cache_resource
+def _radar_client():
+    return pipeline.build_radar_client()
+
+
+@st.cache_data(ttl=RADAR_CACHE_TTL_S, show_spinner="Loading the rain radar…")
+def _radar_frames():
+    try:
+        return pipeline.fetch_radar_frames(_radar_client()), None
+    except APIError as exc:
+        return [], str(exc)
 
 
 @st.cache_data(ttl=CACHE_TTL_S, show_spinner="Loading the 5-day forecast…")
@@ -372,6 +386,34 @@ def _attraction_card(a, container, removable: bool = False) -> None:
             _remove_control(a.attraction)
 
 
+def _radar_controls(city: Location, tz_offset: int, radius_km: float) -> list[dict] | None:
+    """Rain-radar toggle and time slider. Returns the map layers to draw, or None when radar is off."""
+    if not st.toggle("🌧️ Rain radar", key="closeup_radar",
+                     help="Real radar readings from the past 2 hours, every 10 minutes (RainViewer)."):
+        return None
+    frames, error = _radar_frames()
+    if error:
+        st.warning(f"Rain radar unavailable: {error}")
+        return None
+    if not frames:
+        st.info("No rain-radar pictures are available right now. Try again in a few minutes.")
+        return None
+
+    # Labels must not change between reruns: Streamlit identifies the slider by its labels, so a label
+    # like "5 min ago" would reset the slider every minute. They only change when a new frame arrives,
+    # and then the slider starting again at the latest picture is what we want.
+    labels = [f"{f.time + timedelta(seconds=tz_offset):%H:%M}" for f in frames]
+    i = st.select_slider("Radar time (local)", options=list(range(len(frames))), value=len(frames) - 1,
+                         format_func=labels.__getitem__)
+    st.caption(f"Showing the radar from {frames[i].minutes_ago()} min ago. "
+               "Radar by [RainViewer](https://www.rainviewer.com/). Move the slider to see where the rain is "
+               "heading. The free service stops at regional detail, so up close the rain looks blocky, and some "
+               "countries have no radar coverage: no colour there does not always mean dry.")
+    tiles = transform.radar_tiles(city.lat, city.lon, max(RADAR_PAD_KM, 3 * radius_km),
+                                  charts.zoom_for_radius(radius_km))
+    return charts.radar_layers(frames[i], tiles)
+
+
 def _closeup_tab(cities: list[Location], attractions, assumptions: Assumptions) -> None:
     c1, c2, c3, c4 = st.columns([2, 2, 1, 2])
     city = c1.selectbox("City", cities, format_func=str, key="closeup_city")
@@ -429,8 +471,10 @@ def _closeup_tab(cities: list[Location], attractions, assumptions: Assumptions) 
 
     field = (transform.smooth_closeup_field(grid_df, city, grid_size, float(radius), layer)
              if style == "Smooth" else None)
+    radar = _radar_controls(city, centre.tz_offset, float(radius))
     st.plotly_chart(
-        charts.closeup_map(grid_df, visible_df, (city.lat, city.lon), layer, float(radius), grid_size, field, fit),
+        charts.closeup_map(grid_df, visible_df, (city.lat, city.lon), layer, float(radius), grid_size, field, fit,
+                           radar=radar),
         width="stretch",
     )
     _show_errors(batch.errors)

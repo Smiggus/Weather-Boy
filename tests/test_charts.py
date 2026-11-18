@@ -5,10 +5,11 @@ import struct
 import zlib
 
 import numpy as np
+import pytest
 
 import pandas as pd
 
-from weather_insights.charts import bar_order, field_to_rgba, ramp_colorscale, rgba_to_png_data_uri
+from weather_insights.charts import bar_order, edge_fade, field_to_rgba, ramp_colorscale, rgba_to_png_data_uri
 
 
 def decode_png(uri):
@@ -40,6 +41,34 @@ def test_field_colours_follow_the_ramp_and_alpha():
     rgba = field_to_rgba(values, alpha, 0.0, 10.0, "temp", max_opacity=1.0)
     assert tuple(rgba[0, 0]) == (0x31, 0x36, 0x95, 255)  # coldest colour, fully opaque
     assert tuple(rgba[0, 1][:3]) == (0xA5, 0x00, 0x26) and rgba[0, 1, 3] == 0  # hottest colour, transparent
+
+
+def test_edge_fade_is_solid_inside_and_clear_at_the_edges():
+    mask = edge_fade(11, 21, margin=4)
+    assert mask.shape == (11, 21)
+    assert (mask[4:7, 4:17] == 1.0).all()  # everything at least `margin` pixels in: full colour
+    assert mask[0, :].max() == 0 and mask[:, -1].max() == 0  # edges: fully see-through
+    assert mask[5, 1] < mask[5, 2] < mask[5, 3] < 1  # eases in towards the inside
+    assert mask[2, 2] < min(mask[5, 2], mask[2, 10])  # corners fade from both sides, so they round off
+
+
+def test_edge_fade_margin_zero_is_solid():
+    assert (edge_fade(4, 4, margin=0) == 1).all()
+
+
+def test_padding_keeps_the_readings_inside_the_solid_part():
+    from weather_insights.charts import pad_field
+
+    values = np.arange(16.0).reshape(4, 4)
+    field = {"values": values, "north": 40.6, "south": 40.2, "west": -3.9, "east": -3.5}
+    padded, pad = pad_field(field, 0.5)
+    assert pad == 2 and padded["values"].shape == (8, 8)
+    assert (padded["values"][pad:-pad, pad:-pad] == values).all()  # the original surface is untouched
+    assert padded["values"][0, 0] == values[0, 0] and padded["values"][-1, -1] == values[-1, -1]  # edges repeated
+    assert padded["west"] == pytest.approx(-3.9 - 0.4 * 2 / 3) and padded["east"] == pytest.approx(-3.5 + 0.4 * 2 / 3)
+    assert padded["north"] > 40.6 and padded["south"] < 40.2
+    mask = edge_fade(*padded["values"].shape, margin=pad)
+    assert (mask[pad:-pad, pad:-pad] == 1).all()  # outermost readings keep their full colour
 
 
 def test_constant_field_does_not_divide_by_zero():

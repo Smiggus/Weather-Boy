@@ -6,11 +6,11 @@ from dataclasses import dataclass
 
 from .config import ATTRACTIONS_CSV, LOG_CSV, USER_ATTRACTIONS_CSV, get_api_key
 from .extract import (
-    BatchResult, InvalidInputError, NominatimClient, OpenWeatherClient, fetch_many,
+    BatchResult, InvalidInputError, NominatimClient, OpenWeatherClient, RainViewerClient, fetch_many,
     validate_opening_hours, validate_poi_coordinates, validate_poi_name,
 )
 from .load import append_snapshots, delete_user_attraction, save_user_attraction, save_user_city
-from .models import Assumptions, Attraction, Location, POICandidate, WeatherSnapshot
+from .models import Assumptions, Attraction, Location, POICandidate, RadarFrame, WeatherSnapshot
 from .transform import assess_city, build_grid
 
 
@@ -59,6 +59,16 @@ def build_place_client() -> NominatimClient:
 def find_poi(client: NominatimClient, name: str, city: Location) -> list[POICandidate]:
     """Possible matches for a place the user typed in, near ``city``. Empty if nothing fits."""
     return client.search_poi(name, city)
+
+
+def build_radar_client() -> RainViewerClient:
+    """Create the rain-radar client (RainViewer needs no API key)."""
+    return RainViewerClient()
+
+
+def fetch_radar_frames(client: RainViewerClient) -> list[RadarFrame]:
+    """Rain-radar frames from the past ~2 hours, oldest first."""
+    return client.radar_frames()
 
 
 def _clean_category(raw: str) -> str:

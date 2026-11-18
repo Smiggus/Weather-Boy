@@ -55,9 +55,9 @@ def test_filters_update_cards_and_map_without_fetching_again(monkeypatch):
     monkeypatch.setattr(ui, "_forecast_data", lambda *args: ([], None))
     monkeypatch.setattr(transform, "smooth_closeup_field", lambda *args: None)
     original_map = charts.closeup_map
-    def record_map(grid, attractions, *args):
+    def record_map(grid, attractions, *args, **kwargs):
         map_names.append([] if attractions.empty else list(attractions["Attraction"]))
-        return original_map(grid, attractions, *args)
+        return original_map(grid, attractions, *args, **kwargs)
     monkeypatch.setattr(charts, "closeup_map", record_map)
     def record_card(a, container, removable=False):
         card_names.append(a.attraction.name)

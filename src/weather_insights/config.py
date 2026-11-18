@@ -35,6 +35,18 @@ POI_MAX_RESULTS = 5  # candidate matches shown to the user
 POI_SEARCH_BOX_DEG = 0.5  # search +/- this many degrees around the city centre
 POI_MAX_KM_FROM_CITY = 45  # reject matches further than this (same limit the catalogue tests enforce)
 
+# Rain radar overlay (RainViewer; free for personal/educational use, no API key, attribution required).
+RAINVIEWER_BASE_URL = "https://api.rainviewer.com"
+RAINVIEWER_MAX_CALLS_PER_MINUTE = 60  # RainViewer allows 100 requests per minute per IP; keep headroom
+RADAR_MAX_ZOOM = 7  # the free tier only serves tiles up to zoom 7; deeper tiles are a "not supported" image
+RADAR_TILE_SIZE = 512  # pixels per tile: 256 or 512
+RADAR_COLOR_SCHEME = 2  # RainViewer colour scheme id (2 = "Universal Blue")
+RADAR_OPTIONS = "1_1"  # {smooth}_{snow}: smoothed image, snow drawn in its own colours
+RADAR_PAD_KM = 200  # cover at least this far around the centre so the overlay fills the visible map
+RADAR_MAX_TILES = 16  # most radar pictures one map loads; beyond that a coarser zoom is used
+RADAR_OPACITY = 0.7  # how strongly the radar covers the map below it (0-1)
+RADAR_CACHE_TTL_S = 300  # radar frames arrive every 10 minutes; re-check the list every 5
+
 load_dotenv(PROJECT_ROOT / ".env")
 
 
